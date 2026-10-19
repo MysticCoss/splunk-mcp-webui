@@ -38,18 +38,32 @@ def splunk_run_query(
     query: str,
     earliest_time: str = "-24h",
     latest_time: str = "now",
+    row_limit: int = 100,
+    offset: int = 0,
+    max_raw_chars: int = 1000,
 ) -> str:
     """Execute a Splunk search query and return the results. Use this to retrieve log data, perform aggregations, analyze events, and extract insights.
 
     Args:
         query: Valid SPL query to execute.
             Validation: SPL query is required and limited to 5000 characters.
-    Args:
         earliest_time: Start time for search (e.g., -24h, -1d).
         latest_time: End time for search (e.g., now, -1h). If omitted, defaults to now.
+        row_limit: Maximum number of rows to return (1-1000). Default 100.
+        offset: Result offset for pagination. If truncated=true, re-run with offset=next_offset to get the next page.
+        max_raw_chars: Max characters per _raw value (0 disables truncation). Default 1000.
     """
     try:
-        return _json(_get_client().run_search(query, earliest_time, latest_time))
+        return _json(
+            _get_client().run_search(
+                query,
+                earliest_time,
+                latest_time,
+                row_limit=row_limit,
+                offset=offset,
+                max_raw_chars=max_raw_chars,
+            )
+        )
     except SplunkWebError as exc:
         return _json({"error": str(exc), "status_code": exc.status_code})
     except ConfigError as exc:
@@ -57,14 +71,15 @@ def splunk_run_query(
 
 
 @mcp.tool()
-def splunk_get_indexes(row_limit: int = 1000) -> str:
+def splunk_get_indexes(row_limit: int = 1000, full: bool = False) -> str:
     """Get a list of indexes from Splunk. Indexes are data repositories where machine data is stored and organized.
 
     Args:
         row_limit: Maximum number of rows to return (1-1000).
+        full: Return the full index configuration (100+ fields) instead of the compact summary. Only use when needed.
     """
     try:
-        return _json(_get_client().get_indexes(offset=0, count=row_limit))
+        return _json(_get_client().get_indexes(offset=0, count=row_limit, full=full))
     except SplunkWebError as exc:
         return _json({"error": str(exc), "status_code": exc.status_code})
     except ConfigError as exc:

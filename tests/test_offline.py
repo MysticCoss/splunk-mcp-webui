@@ -46,7 +46,18 @@ SEARCH_RESULTS = {
     "init_offset": 0,
     "messages": [],
     "fields": [{"name": "index"}, {"name": "count"}],
-    "results": [{"index": "main", "count": "42"}, {"index": "firewall", "count": "7"}],
+    "results": [
+        {
+            "index": "main",
+            "count": "42",
+            "_raw": "sample raw event for main index " + "x" * 120,
+        },
+        {
+            "index": "firewall",
+            "count": "7",
+            "_raw": "sample raw event for firewall index " + "y" * 130,
+        },
+    ],
 }
 
 state = {"jobs": {}, "auth_ok": True, "force_relogin": False}
@@ -221,7 +232,43 @@ def main():
     client.default_row_limit = 1
     out = client.run_search("index=*")
     check("truncation flagged", out.get("truncated") is True and out["total_result_count"] == 2)
+    check("truncation next_offset", out.get("next_offset") == 1)
     client.default_row_limit = 100
+
+    # --- offset pagination ---------------------------------------------- #
+    out = client.run_search("index=*", row_limit=1, offset=1)
+    check(
+        "offset pagination returns second row",
+        out.get("results") == [SEARCH_RESULTS["results"][1]] and out.get("offset") == 1,
+    )
+    check("offset pagination last page not truncated", "truncated" not in out)
+
+    # --- _raw truncation ------------------------------------------------- #
+    out = client.run_search("index=*")
+    check("no raw truncation under limit", "raw_truncated" not in out)
+    client.max_raw_chars = 20
+    out = client.run_search("index=*")
+    check(
+        "raw truncated at limit",
+        out.get("raw_truncated") is True
+        and all(len(r["_raw"]) <= 20 for r in out["results"]),
+    )
+    client.max_raw_chars = 0
+    out = client.run_search("index=*")
+    check("raw truncation disabled with 0", "raw_truncated" not in out)
+    client.max_raw_chars = 1000
+
+    # --- compact index list ---------------------------------------------- #
+    out = client.get_indexes()
+    compact_keys = set(out["indexes"][0].keys())
+    check(
+        "compact index fields only",
+        compact_keys <= {"name", "datatype", "disabled", "currentDBSizeMB", "totalEventCount", "splunk_server", "minTime", "maxTime"}
+        and "name" in compact_keys,
+    )
+    out = client.get_indexes(full=True)
+    main_full = next(i for i in out["indexes"] if i["name"] == "main")
+    check("full index keeps extra fields", "maxDataSize" in main_full)
 
     # --- metadata + indexes ------------------------------------------- #
     out = client.get_metadata("hosts", index="main", earliest_time="-1h")

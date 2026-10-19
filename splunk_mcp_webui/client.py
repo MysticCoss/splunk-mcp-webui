@@ -35,6 +35,13 @@ _GENERATING_COMMANDS = frozenset({
     "mstats", "mcatalog", "makeresults", "input", "summarize", "collect",
 })
 
+# Fields kept in the compact (default) index listing; the full flattened
+# entry carries 100+ low-level storage settings that waste LLM context.
+_COMPACT_INDEX_FIELDS = (
+    "name", "datatype", "disabled", "currentDBSizeMB", "totalEventCount",
+    "splunk_server", "minTime", "maxTime",
+)
+
 _LOCALE_RE = re.compile(r"^https?://[^/]+/([A-Za-z]{2,3}-[A-Za-z]{2,3})$")
 _SCHEME_RE = re.compile(r"^(https?)://", re.IGNORECASE)
 
@@ -64,6 +71,7 @@ class SplunkWebClient:
         poll_interval: float = 1.0,
         default_row_limit: int = 100,
         max_row_limit: int = 1000,
+        max_raw_chars: int = 1000,
     ):
         base_url = splunk_url.strip().rstrip("/")
         if not _SCHEME_RE.match(base_url):
@@ -85,6 +93,7 @@ class SplunkWebClient:
         self.poll_interval = max(0.2, float(poll_interval))
         self.default_row_limit = int(default_row_limit)
         self.max_row_limit = int(max_row_limit)
+        self.max_raw_chars = max(0, int(max_raw_chars))
 
         self.session = requests.Session()
         self.session.verify = self.verify_ssl
@@ -301,6 +310,8 @@ class SplunkWebClient:
         earliest_time: Optional[str] = None,
         latest_time: Optional[str] = None,
         row_limit: Optional[int] = None,
+        offset: int = 0,
+        max_raw_chars: Optional[int] = None,
     ) -> Dict[str, Any]:
         query = (query or "").strip()
         if not query:
@@ -309,6 +320,8 @@ class SplunkWebClient:
 
         row_limit = self.default_row_limit if row_limit is None else int(row_limit)
         row_limit = max(1, min(row_limit, self.max_row_limit))
+        offset = max(0, int(offset or 0))
+        max_raw = self.max_raw_chars if max_raw_chars is None else max(0, int(max_raw_chars))
 
         data: Dict[str, Any] = {"search": query, "exec_mode": "normal", "output_mode": "json"}
         if earliest_time:
@@ -331,24 +344,45 @@ class SplunkWebClient:
             )
 
         result_count = int(job_info.get("resultCount") or 0)
-        results, fields = self._fetch_results(sid, row_limit)
+        results, fields = self._fetch_results(sid, row_limit, offset)
+
+        raw_truncated = False
+        if max_raw > 0:
+            for row in results:
+                raw = row.get("_raw")
+                if isinstance(raw, str) and len(raw) > max_raw:
+                    row["_raw"] = raw[:max_raw]
+                    raw_truncated = True
 
         output: Dict[str, Any] = {
             "sid": sid,
             "results": results,
             "result_count": len(results),
             "total_result_count": result_count,
+            "offset": offset,
             "fields": fields,
         }
         messages = self._job_messages(job_info)
         if messages:
             output["messages"] = messages
-        if result_count > len(results):
+
+        truncated = offset + len(results) < result_count
+        if truncated:
             output["truncated"] = True
-            output["note"] = (
-                "Showing {} of {} results. Narrow the time range or aggregate the "
-                "query (e.g. with stats) to see more.".format(len(results), result_count)
-            )
+            output["next_offset"] = offset + len(results)
+        if raw_truncated:
+            output["raw_truncated"] = True
+        if truncated or raw_truncated:
+            notes = []
+            if truncated:
+                notes.append(
+                    "Showing {} of {} results (offset {}). Set offset={} to get the next page."
+                    .format(len(results), result_count, offset, offset + len(results))
+                )
+            if raw_truncated:
+                notes.append("_raw values were truncated to {} chars (max_raw_chars).".format(max_raw))
+            output["note"] = " ".join(notes)
+
         if job_info.get("runDuration"):
             output["run_duration_seconds"] = round(float(job_info["runDuration"]), 3)
         return output
@@ -386,11 +420,11 @@ class SplunkWebClient:
                 cleaned.append(str(msg))
         return cleaned
 
-    def _fetch_results(self, sid: str, row_limit: int):
+    def _fetch_results(self, sid: str, row_limit: int, offset: int = 0):
         payload = self._proxy_request(
             "GET",
             "services/search/jobs/{}/results".format(sid),
-            params={"output_mode": "json", "count": row_limit, "offset": 0},
+            params={"output_mode": "json", "count": row_limit, "offset": offset},
             timeout=self.search_timeout,
         )
         return payload.get("results", []), payload.get("fields", [])
@@ -405,7 +439,7 @@ class SplunkWebClient:
         flat.update(content)
         return flat
 
-    def get_indexes(self, offset: int = 0, count: Optional[int] = None) -> Dict[str, Any]:
+    def get_indexes(self, offset: int = 0, count: Optional[int] = None, full: bool = False) -> Dict[str, Any]:
         params: Dict[str, Any] = {
             "output_mode": "json",
             "datatype": "all",
@@ -414,7 +448,13 @@ class SplunkWebClient:
         }
         payload = self._proxy_request("GET", "servicesNS/-/-/data/indexes", params=params)
         entries = payload.get("entry") or []
-        indexes = [self._flatten_entry(e) for e in entries]
+        if full:
+            indexes = [self._flatten_entry(e) for e in entries]
+        else:
+            indexes = [
+                {field: flat.get(field) for field in _COMPACT_INDEX_FIELDS}
+                for flat in (self._flatten_entry(e) for e in entries)
+            ]
         indexes.sort(key=lambda item: (item.get("name") or "").lower())
         indexes = [i for i in indexes if not (i.get("name") or "").startswith("__")]
 

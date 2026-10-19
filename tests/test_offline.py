@@ -303,6 +303,21 @@ def main():
     except SplunkWebError:
         check("index name validated", True)
 
+    # --- read-only guard -------------------------------------------------- #
+    client.read_only = True
+    try:
+        client.run_search("index=* | delete")
+        check("read_only blocks delete", False)
+    except SplunkWebError as exc:
+        check("read_only blocks delete", "read_only" in str(exc))
+
+    out = client.run_search('index=* | where match(src, "a|b|delete")')
+    check("read_only allows pipes inside quotes", out.get("sid") == "sid_123")
+
+    client.read_only = False
+    out = client.run_search("index=* | delete")
+    check("read_only=false allows delete", out.get("sid") == "sid_123")
+
     # --- auth failures -------------------------------------------------- #
     bad = SplunkWebClient(base, USER, "wrongpass", verify_ssl=False)
     try:

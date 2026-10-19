@@ -35,6 +35,14 @@ _GENERATING_COMMANDS = frozenset({
     "mstats", "mcatalog", "makeresults", "input", "summarize", "collect",
 })
 
+# SPL commands that mutate data or hand off control — blocked when the
+# read_only config flag is enabled (default). Best-effort: only the first
+# command of each search pipeline segment is inspected.
+_RESTRICTED_COMMANDS = frozenset({
+    "delete", "outputlookup", "outputcsv", "sendemail", "sendalert",
+    "summaryindex", "collect", "tscollect", "stash", "script", "run",
+})
+
 # Fields kept in the compact (default) index listing; the full flattened
 # entry carries 100+ low-level storage settings that waste LLM context.
 _COMPACT_INDEX_FIELDS = (
@@ -72,6 +80,7 @@ class SplunkWebClient:
         default_row_limit: int = 100,
         max_row_limit: int = 1000,
         max_raw_chars: int = 1000,
+        read_only: bool = True,
     ):
         base_url = splunk_url.strip().rstrip("/")
         if not _SCHEME_RE.match(base_url):
@@ -94,6 +103,7 @@ class SplunkWebClient:
         self.default_row_limit = int(default_row_limit)
         self.max_row_limit = int(max_row_limit)
         self.max_raw_chars = max(0, int(max_raw_chars))
+        self.read_only = bool(read_only)
 
         self.session = requests.Session()
         self.session.verify = self.verify_ssl
@@ -292,6 +302,38 @@ class SplunkWebClient:
     # Search job execution
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _mask_quoted(query: str) -> str:
+        """Replace double-quoted string contents with spaces so ``|`` inside
+        quoted values does not confuse pipeline segmentation."""
+        out = []
+        in_quotes = False
+        i = 0
+        while i < len(query):
+            char = query[i]
+            if char == "\\" and in_quotes:
+                out.append(" ")
+                i += 2
+                continue
+            if char == '"':
+                in_quotes = not in_quotes
+                out.append(char)
+                i += 1
+                continue
+            out.append(" " if in_quotes else char)
+            i += 1
+        return "".join(out)
+
+    def _enforce_read_only(self, query: str) -> None:
+        masked = self._mask_quoted(query)
+        for segment in masked.split("|"):
+            tokens = segment.strip().split(None, 1)
+            if tokens and tokens[0].lower() in _RESTRICTED_COMMANDS:
+                raise SplunkWebError(
+                    "Query blocked by read_only=true: '{}' command is not allowed. "
+                    "Set read_only=false in config.json to permit data-mutating commands.".format(tokens[0])
+                )
+
+    @staticmethod
     def _normalize_query(query: str) -> str:
         """splunkd's REST endpoint requires an explicit generating command:
         a query like ``index=* ...`` is rejected with ``Unknown search
@@ -316,6 +358,8 @@ class SplunkWebClient:
         query = (query or "").strip()
         if not query:
             raise SplunkWebError("Query must not be empty")
+        if self.read_only:
+            self._enforce_read_only(query)
         query = self._normalize_query(query)
 
         row_limit = self.default_row_limit if row_limit is None else int(row_limit)
@@ -538,6 +582,8 @@ def client_from_config() -> SplunkWebClient:
             poll_interval=config.get("poll_interval", 1.0),
             default_row_limit=config.get("default_row_limit", 100),
             max_row_limit=config.get("max_row_limit", 1000),
+            max_raw_chars=config.get("max_raw_chars", 1000),
+            read_only=config.get("read_only", True),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError("Invalid value in config file: {}".format(exc)) from exc

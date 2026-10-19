@@ -8,6 +8,8 @@ REQUIRED_KEYS = ("splunk_url", "username", "password")
 DEFAULTS: Dict[str, Any] = {
     "locale": "en-US",
     "verify_ssl": False,
+    "read_only": True,
+    "max_raw_chars": 1000,
     "request_timeout": 60.0,
     "search_timeout": 300.0,
     "poll_interval": 1.0,

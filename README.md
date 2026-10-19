@@ -8,7 +8,7 @@ MCP (Model Context Protocol) server cho Splunk — dựa trên các tool của S
 |---|---|---|
 | Kết nối | splunkd REST API (port 8089) + token/app cài trong Splunk | **Splunk Web UI (port 8000)** — login bằng form như trình duyệt |
 | Cấu hình | token, cert, app, roles... | **Chỉ 3 field: `splunk_url`, `username`, `password`** |
-| Số tool | ~20 | **4 tool cốt lõi** |
+| Số tool | ~20 | **6 tool cốt lõi** |
 
 Chỉ cần Splunk Web mở được là dùng được — không cần port quản trị 8089, không cần token, không cần cài app lên Splunk.
 
@@ -17,6 +17,8 @@ Chỉ cần Splunk Web mở được là dùng được — không cần port qu
 | Tool | Mô tả |
 |---|---|
 | `splunk_run_query` | Chạy SPL query, trả về kết quả JSON (mặc định 100 dòng, có `truncated` + `next_offset` để lấy trang tiếp; `_raw` tự cắt ở 1000 ký tự) |
+| `splunk_get_job_results` | Lấy tiếp kết quả của 1 job đã chạy xong **theo sid** — phân trang khối lượng lớn mà không phải chạy lại search |
+| `splunk_get_search_job_status` | Xem trạng thái 1 job (done/running/failed) và tổng số kết quả |
 | `splunk_get_indexes` | Danh sách index dạng compact (tên, kích thước, số event, splunk_server...); `full: true` để lấy toàn bộ config |
 | `splunk_get_index_info` | Thông tin chi tiết 1 index |
 | `splunk_get_metadata` | Metadata `hosts` / `sources` / `sourcetypes` theo index và khoảng thời gian |
@@ -24,9 +26,12 @@ Chỉ cần Splunk Web mở được là dùng được — không cần port qu
 ## Cài đặt
 
 ```powershell
-cd C:\Users\vitco\splunk-mcp-webui
+git clone https://github.com/MysticCoss/splunk-mcp-webui
+cd splunk-mcp-webui
 pip install -r requirements.txt
 ```
+
+Hoặc cài như package: `pip install git+https://github.com/MysticCoss/splunk-mcp-webui` — sau đó chạy bằng lệnh `splunk-mcp-webui`.
 
 ## Cấu hình
 
@@ -47,7 +52,7 @@ Các key tùy chọn (đều có giá trị mặc định, không cần khai bá
 | Key | Mặc định | Mô tả |
 |---|---|---|
 | `locale` | `en-US` | Locale path của Splunk Web (`vi-VN`, `en-US`...) — tự detect khi có thể |
-| `verify_ssl` | `false` | Xác thực chứng chỉ SSL — mặc định chấp nhận self-signed (xem bên dưới) |
+| `verify_ssl` | `false` | Xác thực chứng chỉ SSL — mặc định chấp nhận self-signed; đặt `true` để xác thực nghiêm ngặt hoặc đường dẫn CA bundle nội bộ |
 | `read_only` | `true` | Chặn các SPL command sửa dữ liệu: `delete`, `outputlookup`, `collect`, `script`, `sendemail`... Đặt `false` để cho phép |
 | `max_raw_chars` | `1000` | Giới hạn ký tự của field `_raw` trong kết quả search (0 = không giới hạn) |
 | `request_timeout` | `60` | Timeout cho mỗi HTTP request (giây) |
@@ -66,18 +71,32 @@ Mặc định client **chấp nhận mọi chứng chỉ SSL** — kể cả sel
 }
 ```
 
-Đây là giá trị mặc định, không cần khai báo trong `config.json`. Chỉ khi muốn xác thực chứng chỉ nghiêm ngặt (ví dụ Splunk dùng cert CA hợp lệ) thì mới đặt:
+Đây là giá trị mặc định, không cần khai báo trong `config.json`. Chỉ khi muốn xác thực chứng chỉ nghiêm ngặt thì mới đặt `true`, hoặc trỏ tới **CA bundle nội bộ** (hỗ trợ cert CA riêng của công ty):
 
 ```json
 {
-  "verify_ssl": true
+  "verify_ssl": "C:\\certs\\corp-ca.pem"
 }
 ```
 
 Đó là tất cả. Mọi thứ khác tự xử lý: tự detect `http/https`, locale (`en-US`...), session cookie, CSRF form-key, tự re-login khi session hết hạn, SSL self-signed được tự động chấp nhận.
 
-> `splunk_url` chấp nhận mọi dạng: `splunk.corp.local`, `http://10.0.0.5:8000`, `https://splunk.corp.local:8000/en-US`.
-> Mật khẩu nằm trong file plain-text — hạn chế quyền đọc file nếu cần. Có thể đặt đường dẫn khác qua biến môi trường `SPLUNK_MCP_CONFIG`.
+> `splunk_url` chấp nhận mọi dạng: `splunk.corp.local`, `10.0.0.5:8000`, `http://10.0.0.5:8000`, `https://splunk.corp.local:8000/en-US`.
+> Mật khẩu có thể đặt qua biến môi trường `SPLUNK_URL` / `SPLUNK_USERNAME` / `SPLUNK_PASSWORD` (ghi đè file) để không lưu plain-text. Đường dẫn config khác: `SPLUNK_MCP_CONFIG`.
+> ⚠️ Khi `splunk_url` ghi rõ `https://`, client **không bao giờ** tự hạ cấp xuống HTTP — handshake TLS hỏng sẽ báo lỗi thay vì gửi mật khẩu plaintext.
+
+## Bảo mật — dùng tài khoản quyền tối thiểu
+
+`read_only: true` (mặc định) chặn các lệnh sửa dữ liệu (`delete`, `outputlookup`, `mcollect`, `dump`, `script`, `map`, `savedsearch`, macro...) — nhưng đây là **lớp bảo vệ best-effort**, không thay thế phân quyền của Splunk. Hãy tạo account MCP riêng với quyền tối thiểu:
+
+- **Không có** capability `can_delete`
+- **Không có** quyền `list_storage_passwords` (tránh lộ mật khẩu đã lưu qua lệnh `rest`)
+- Giới hạn `srchIndexesAllowed` đúng các index cần đọc
+- Giới hạn `srchJobsQuota` và `srchTimeWin` (cửa sổ thời gian tìm kiếm)
+
+Ngoài ra lưu ý: nội dung log (có thể chứa PII/dữ liệu nhạy cảm) sẽ được gửi tới nhà cung cấp LLM qua MCP client — cân nhắc khi dùng với dữ liệu SOC nội bộ.
+
+> SSO/SAML: login đi qua form local-credential (`loginType=splunk`) nên **hoạt động trên instance bật SSO** (kể cả Azure AD). Tuy nhiên account phải dùng xác thực local (username/password) — SAML-only/MFA-only không dùng được.
 
 ## Kiểm tra kết nối trước khi dùng
 
@@ -94,7 +113,7 @@ claude mcp add splunk-webui -s user -- python C:\duong\dan\splunk-mcp-webui\run.
 ```
 
 - `-s user`: cài cấp user, dùng được cho mọi project trên máy. Bỏ tham số này thì chỉ áp dụng cho project hiện tại.
-- Kiểm tra: mở Claude Code, gõ `/mcp` — phải thấy `splunk-webui` kèm 4 tool.
+- Kiểm tra: mở Claude Code, gõ `/mcp` — phải thấy `splunk-webui` kèm 6 tool.
 
 ### Claude Desktop / opencode
 
@@ -129,8 +148,11 @@ Không dùng port 8089 — mọi REST call đi qua proxy `splunkd/__raw/` của 
 ## Test offline (không cần Splunk thật)
 
 ```powershell
-python tests\test_offline.py      # 16 test: login, CSRF, search job, 404, re-login...
-python tests\test_mcp_server.py   # test 4 tool qua giao thức MCP
+python tests\test_offline.py       # 46 test: login cũ/mới, CSRF, guard, timeout, SSL fallback, concurrency...
+python tests\test_config.py        # 12 test: validation config, env override, fail-loud
+python tests\test_mcp_server.py    # test 6 tool qua giao thức MCP
 ```
 
-Thư mục `ref\` chứa bản giải nén `splunk-mcp-server_200.tgz` (app chính hãng) dùng làm tham chiếu schema cho 4 tool.
+License: MIT (xem `LICENSE`).
+
+> Thư mục `ref\` (bản giải nén app MCP chính hãng làm tham chiếu schema) không được commit vào repo — tham khảo `splunk-mcp-server_200.tgz` từ SplunkBase nếu cần.

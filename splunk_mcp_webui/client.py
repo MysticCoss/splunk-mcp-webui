@@ -8,7 +8,9 @@ cookie issued by Splunk Web.
 """
 
 import json
+import logging
 import re
+import threading
 import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
@@ -17,6 +19,8 @@ import requests
 import urllib3
 
 from .config import ConfigError
+
+logger = logging.getLogger("splunk_mcp_webui.client")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -39,9 +43,19 @@ _GENERATING_COMMANDS = frozenset({
 # read_only config flag is enabled (default). Best-effort: only the first
 # command of each search pipeline segment is inspected.
 _RESTRICTED_COMMANDS = frozenset({
-    "delete", "outputlookup", "outputcsv", "sendemail", "sendalert",
-    "summaryindex", "collect", "tscollect", "stash", "script", "run",
+    "delete", "outputlookup", "outputcsv", "outputtelemetry", "sendemail",
+    "sendalert", "summaryindex", "collect", "tscollect", "stash", "script",
+    "run", "mcollect", "meventcollect", "dump", "runshellscript", "exec",
 })
+
+# Commands that can smuggle arbitrary nested SPL (quoted subsearches, saved
+# searches) — a segment-level scan cannot see what they execute, so they are
+# blocked outright under read_only.
+_OPAQUE_COMMANDS = frozenset({"map", "savedsearch"})
+
+_MACRO_RE = re.compile(r"`[^`]+`")
+_REST_PASSWORD_RE = re.compile(r"storage[_/]?password", re.IGNORECASE)
+_MAX_GUARD_DEPTH = 3
 
 # Fields kept in the compact (default) index listing; the full flattened
 # entry carries 100+ low-level storage settings that waste LLM context.
@@ -85,6 +99,7 @@ class SplunkWebClient:
         base_url = splunk_url.strip().rstrip("/")
         if not _SCHEME_RE.match(base_url):
             base_url = "https://" + base_url
+        self._explicit_scheme = bool(_SCHEME_RE.match(splunk_url.strip()))
 
         locale_match = _LOCALE_RE.match(base_url)
         if locale_match:
@@ -96,6 +111,7 @@ class SplunkWebClient:
         self.base_url = base_url
         self.username = username
         self.password = password
+        # verify_ssl may be a bool or a path to a CA bundle file.
         self.verify_ssl = verify_ssl
         self.request_timeout = float(request_timeout)
         self.search_timeout = float(search_timeout)
@@ -109,6 +125,13 @@ class SplunkWebClient:
         self.session.verify = self.verify_ssl
         self.form_key: Optional[str] = None
         self._logged_in = False
+        # Tool calls may run concurrently in MCP thread pools: guard the
+        # session cookie jar and the re-login dance behind a lock. A
+        # generation counter lets one thread refresh the session while
+        # others simply retry against it.
+        self._login_lock = threading.RLock()
+        self._session_generation = 0
+        self._auth_cooldown_until = 0.0
 
     # ------------------------------------------------------------------ #
     # URL helpers
@@ -130,9 +153,24 @@ class SplunkWebClient:
         return None
 
     def login(self, force: bool = False) -> None:
-        if self._logged_in and not force:
-            return
+        """Ensure a valid session exists. Thread-safe: concurrent tool calls
+        share one session, so re-login is serialized and deduplicated via a
+        generation counter. After an authentication failure, further attempts
+        are suspended for a cooldown to avoid locking the Splunk account."""
+        with self._login_lock:
+            if self._logged_in and not force:
+                return
+            if force and time.monotonic() < self._auth_cooldown_until:
+                raise SplunkAuthError(
+                    "Authentication for user '{}' is in cooldown after recent failures; "
+                    "retry in {}s (avoid locking the account)".format(
+                        self.username, round(self._auth_cooldown_until - time.monotonic())
+                    )
+                )
+            self._do_login_locked()
 
+    def _do_login_locked(self) -> None:
+        self._logged_in = False
         self.session.cookies.clear()
         self.form_key = None
 
@@ -146,9 +184,26 @@ class SplunkWebClient:
                 timeout=self.request_timeout,
                 allow_redirects=True,
             )
-        except requests.exceptions.SSLError:
-            # Self-signed / TLS trouble on https: fall back to http
-            self.base_url = re.sub(r"^https://", "http://", self.base_url, flags=re.IGNORECASE)
+        except requests.exceptions.SSLError as exc:
+            # Never silently downgrade an explicitly requested https:// to
+            # http:// — that would send credentials in plaintext. The plain-
+            # hostname fallback below only runs when the user did not specify
+            # a scheme and SSL checks are disabled.
+            if self._explicit_scheme or self.verify_ssl:
+                raise SplunkWebError(
+                    "TLS handshake with {} failed: {}. Not falling back to HTTP "
+                    "because the URL specified a scheme or SSL verification is on.".format(
+                        self.base_url, exc
+                    )
+                ) from exc
+            new_base = re.sub(r"^https://", "http://", self.base_url, flags=re.IGNORECASE)
+            logger.warning(
+                "TLS handshake failed for %s; falling back to plain HTTP (%s). "
+                "Credentials will be sent unencrypted!",
+                self.base_url,
+                exc,
+            )
+            self.base_url = new_base
             pre = self.session.get(
                 self._web_url("account/login?loginType=splunk"),
                 timeout=self.request_timeout,
@@ -175,14 +230,22 @@ class SplunkWebClient:
 
         body_lower = response.text.lower()
         if response.status_code in (401, 403) or "login failed" in body_lower:
+            # Suspend further attempts briefly — repeated failures lock the
+            # Splunk account (default lockout threshold is small).
+            self._auth_cooldown_until = time.monotonic() + 120.0
+            reason = "invalid username or password"
+            if response.status_code == 403:
+                reason = "access denied (account locked, missing privilege or IP restricted)"
             raise SplunkAuthError(
-                "Splunk Web login failed for user '{}': invalid username or password "
-                "(HTTP {})".format(self.username, response.status_code),
+                "Splunk Web login failed for user '{}': {} (HTTP {})".format(
+                    self.username, reason, response.status_code
+                ),
                 status_code=response.status_code,
             )
 
         has_session_cookie = any(name.lower().startswith("splunkd") for name in self.session.cookies.keys())
         if not has_session_cookie:
+            self._auth_cooldown_until = time.monotonic() + 120.0
             raise SplunkAuthError(
                 "Splunk Web login did not produce a session cookie. Is '{}' a valid "
                 "Splunk Web endpoint? (HTTP {})".format(self.base_url, response.status_code),
@@ -212,7 +275,10 @@ class SplunkWebClient:
             # accepted as the form key by the splunkd proxy.
             self.form_key = self.session.cookies.get("cval")
 
+        self._session_generation += 1
+        self._auth_cooldown_until = 0.0
         self._logged_in = True
+        logger.info("Logged in to %s as '%s' (session generation %d)", self.base_url, self.username, self._session_generation)
 
     # ------------------------------------------------------------------ #
     # Low level proxy access
@@ -238,6 +304,7 @@ class SplunkWebClient:
         retried: bool = False,
     ) -> Dict[str, Any]:
         self.login()
+        generation = self._session_generation
         url = self._proxy_url(path)
         response = self.session.request(
             method,
@@ -250,14 +317,20 @@ class SplunkWebClient:
         )
 
         if response.status_code in (401, 403) and not retried:
-            # Session expired or CSRF token rotated: re-login once and retry.
-            self.login(force=True)
+            # Session expired or CSRF token rotated: refresh once and retry.
+            # If another concurrent call already refreshed the session, skip
+            # straight to the retry instead of forcing a second login.
+            with self._login_lock:
+                if self._session_generation == generation:
+                    self._do_login_locked()
             return self._proxy_request(method, path, params, data, timeout, retried=True)
 
         if response.status_code == 302 or response.status_code == 303:
             # splunkweb redirects to the login page when the session is gone
             if not retried:
-                self.login(force=True)
+                with self._login_lock:
+                    if self._session_generation == generation:
+                        self._do_login_locked()
                 return self._proxy_request(method, path, params, data, timeout, retried=True)
             raise SplunkAuthError("Splunk Web session could not be established", status_code=302)
 
@@ -292,7 +365,11 @@ class SplunkWebClient:
         except ValueError:
             pass
         text = response.text[:300].replace("\n", " ")
-        if "login" in text.lower() or response.status_code in (401, 403):
+        if response.status_code == 403:
+            return "Splunk Web refused the request on '{}' (HTTP 403). The account lacks the required privilege or capability.".format(
+                path
+            )
+        if "login" in text.lower() or response.status_code == 401:
             return "Splunk Web refused the request on '{}' (HTTP {}). Check credentials.".format(
                 path, response.status_code
             )
@@ -324,14 +401,46 @@ class SplunkWebClient:
         return "".join(out)
 
     def _enforce_read_only(self, query: str) -> None:
+        """Best-effort block of data-mutating SPL. Scans every pipeline
+        segment (quote-masked), recurses into ``[...]`` subsearches, and
+        blocks opaque commands (map/savedsearch) and macros entirely."""
+        self._scan_read_only(query, "", 0)
+
+    def _scan_read_only(self, query: str, context: str, depth: int) -> None:
+        where = " (in{})".format(context) if context else ""
         masked = self._mask_quoted(query)
+
+        if _MACRO_RE.search(masked):
+            raise SplunkWebError(
+                "Query blocked by read_only=true: macro expansion `...` is not allowed{}".format(where)
+            )
+
         for segment in masked.split("|"):
             tokens = segment.strip().split(None, 1)
-            if tokens and tokens[0].lower() in _RESTRICTED_COMMANDS:
+            if not tokens:
+                continue
+            first = tokens[0].lower()
+            if first in _OPAQUE_COMMANDS:
                 raise SplunkWebError(
-                    "Query blocked by read_only=true: '{}' command is not allowed. "
-                    "Set read_only=false in config.json to permit data-mutating commands.".format(tokens[0])
+                    "Query blocked by read_only=true: '{}' command can hide nested SPL and is not allowed{}".format(
+                        first, where
+                    )
                 )
+            if first in _RESTRICTED_COMMANDS:
+                raise SplunkWebError(
+                    "Query blocked by read_only=true: '{}' command is not allowed{}. "
+                    "Set read_only=false in config.json to permit data-mutating commands.".format(first, where)
+                )
+            if first == "rest" and _REST_PASSWORD_RE.search(segment):
+                raise SplunkWebError(
+                    "Query blocked by read_only=true: 'rest' access to stored passwords is not allowed{}".format(where)
+                )
+
+        # Subsearches in square brackets execute their own commands.
+        if depth < _MAX_GUARD_DEPTH:
+            for bracket in re.findall(r"\[([^\[\]]*)\]", masked):
+                if bracket.strip():
+                    self._scan_read_only(bracket, context + " subsearch", depth + 1)
 
     @staticmethod
     def _normalize_query(query: str) -> str:
@@ -358,9 +467,12 @@ class SplunkWebClient:
         query = (query or "").strip()
         if not query:
             raise SplunkWebError("Query must not be empty")
+        query = self._normalize_query(query)
+        # Guard runs on the normalized query so that search TERMS (e.g.
+        # "delete user=bob" as a literal term after the implicit `search`
+        # command) are not mistaken for pipeline commands.
         if self.read_only:
             self._enforce_read_only(query)
-        query = self._normalize_query(query)
 
         row_limit = self.default_row_limit if row_limit is None else int(row_limit)
         row_limit = max(1, min(row_limit, self.max_row_limit))
@@ -372,6 +484,10 @@ class SplunkWebClient:
             data["earliest_time"] = earliest_time
         if latest_time:
             data["latest_time"] = latest_time
+        # Server-side safety nets: kill the job if it exceeds the wall clock
+        # or if the client disappears without cancelling it.
+        data["auto_cancel"] = int(self.search_timeout)
+        data["max_time"] = int(self.search_timeout)
 
         created = self._proxy_request("POST", "services/search/jobs", data=data, timeout=self.search_timeout)
         sid = created.get("sid")
@@ -381,6 +497,14 @@ class SplunkWebClient:
         job_info = self._wait_for_job(sid)
 
         state = job_info.get("dispatchState", "")
+        if state == "TIMEOUT":
+            self._cancel_job(sid)
+            raise SplunkWebError(
+                "Search timed out after {}s and the job was cancelled (sid={}). "
+                "Narrow the time range, add filters, or raise search_timeout in config.json.".format(
+                    int(self.search_timeout), sid
+                )
+            )
         if state == "FAILED":
             messages = self._job_messages(job_info)
             raise SplunkWebError(
@@ -431,9 +555,23 @@ class SplunkWebClient:
             output["run_duration_seconds"] = round(float(job_info["runDuration"]), 3)
         return output
 
+    def _cancel_job(self, sid: str) -> None:
+        """Best-effort job cancellation so timed-out searches do not keep
+        consuming the account's search quota."""
+        try:
+            self._proxy_request(
+                "POST",
+                "services/search/jobs/{}/control".format(sid),
+                data={"action": "cancel"},
+            )
+            logger.info("Cancelled search job %s after timeout", sid)
+        except SplunkWebError as exc:
+            logger.warning("Could not cancel search job %s: %s", sid, exc)
+
     def _wait_for_job(self, sid: str) -> Dict[str, Any]:
         deadline = time.monotonic() + self.search_timeout
         last_state: Dict[str, Any] = {}
+        interval = self.poll_interval
         while time.monotonic() < deadline:
             payload = self._proxy_request(
                 "GET",
@@ -449,8 +587,12 @@ class SplunkWebClient:
                     return last_state
                 if state in ("FAILED",):
                     return last_state
-            time.sleep(self.poll_interval)
-        last_state["dispatchState"] = last_state.get("dispatchState", "TIMEOUT")
+            # Back off gradually (capped) instead of hammering the server.
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            interval = min(interval * 1.5, 5.0)
+        # Deadline reached: mark unambiguously so callers never mistake an
+        # unfinished job for a successful one.
+        last_state["dispatchState"] = "TIMEOUT"
         return last_state
 
     @staticmethod

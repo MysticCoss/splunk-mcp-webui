@@ -62,7 +62,8 @@ SEARCH_RESULTS = {
     ],
 }
 
-state = {"jobs": {}, "auth_ok": True, "force_relogin": False, "mode": "legacy"}
+state = {"jobs": {}, "auth_ok": True, "force_relogin": False, "mode": "legacy",
+         "login_count": 0, "cancelled": None, "never_done": False}
 
 
 class MockSplunkWeb(BaseHTTPRequestHandler):
@@ -95,6 +96,11 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
     def _authed(self):
         jar = self._cookies()
         return jar.get("splunkd_8000") == "sess-key-1"
+
+    def _expected_form_key(self):
+        if state["mode"] == "modern":
+            return self._cookies().get("splunkweb_csrf_token_8000")
+        return FORM_KEY
 
     # routes ----------------------------------------------------------- #
     def do_GET(self):
@@ -140,7 +146,7 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
                 return
             polls = state["jobs"].get(sid, 0) + 1
             state["jobs"][sid] = polls
-            done = polls >= 2
+            done = polls >= 2 and not state["never_done"]
             self._send_json(
                 200,
                 {
@@ -181,9 +187,20 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = parse_qs(self.rfile.read(length).decode("utf-8"))
 
+        # Job control (cancel) — no form key check needed for the mock.
+        if path.startswith("/en-US/splunkd/__raw/services/search/jobs/") and path.endswith("/control"):
+            if not self._authed():
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
+                return
+            if body.get("action", [""])[0] == "cancel":
+                state["cancelled"] = path.rstrip("/").split("/")[-2]
+            self._send_json(200, {"messages": [{"type": "INFO", "text": "cancelled"}]})
+            return
+
         if path == "/en-US/account/login":
             username = body.get("username", [""])[0]
             password = body.get("password", [""])[0]
+            state["login_count"] += 1
             if state["mode"] == "modern":
                 # Modern flow: cval must be posted back and must match the
                 # pre-auth cval cookie; success returns 200 + cookies.
@@ -219,12 +236,7 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
             if not self._authed():
                 self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
-            if state["mode"] == "modern":
-                jar = self._cookies()
-                expected_form_key = jar.get("splunkweb_csrf_token_8000")
-            else:
-                expected_form_key = FORM_KEY
-            if self.headers.get("X-Splunk-Form-Key") != expected_form_key:
+            if self.headers.get("X-Splunk-Form-Key") != self._expected_form_key():
                 self._send_json(400, {"messages": [{"type": "ERROR", "text": "Missing or invalid CSRF header"}]})
                 return
             if body.get("exec_mode", ["normal"])[0] == "oneshot":
@@ -340,7 +352,7 @@ def main():
     except SplunkWebError:
         check("index name validated", True)
 
-    # --- read-only guard -------------------------------------------------- #
+    # --- read-only guard v2 ----------------------------------------------- #
     client.read_only = True
     try:
         client.run_search("index=* | delete")
@@ -348,12 +360,73 @@ def main():
     except SplunkWebError as exc:
         check("read_only blocks delete", "read_only" in str(exc))
 
+    for bypass_query in [
+        '| makeresults | map search="| makeresults | outputlookup evil.csv"',
+        "| mcollect index=main",
+        "| dump",
+        "| runshellscript cmd.sh",
+        "| savedsearch my_saved_search",
+        "search `my_macro_with_write()`",
+        "index=* [ | makeresults | outputlookup evil.csv ]",
+    ]:
+        try:
+            client.run_search(bypass_query)
+            check("guard blocks: " + bypass_query[:40], False)
+        except SplunkWebError as exc:
+            check("guard blocks: " + bypass_query[:40], "read_only" in str(exc))
+
     out = client.run_search('index=* | where match(src, "a|b|delete")')
     check("read_only allows pipes inside quotes", out.get("sid") == "sid_123")
+    out = client.run_search("delete user=bob")
+    check("search terms not treated as commands", out.get("sid") == "sid_123")
+    out = client.run_search("script error in logs | stats count")
+    check("search terms with 'script' allowed", out.get("sid") == "sid_123")
 
     client.read_only = False
     out = client.run_search("index=* | delete")
     check("read_only=false allows delete", out.get("sid") == "sid_123")
+    client.read_only = True
+
+    # --- search timeout: cancel + clear error ------------------------------ #
+    slow = SplunkWebClient(base, USER, PASSWORD, verify_ssl=False, poll_interval=0.05, search_timeout=0.6)
+    slow.login()
+    state["never_done"] = True
+    try:
+        slow.run_search("index=*")
+        check("timeout raises", False)
+    except SplunkWebError as exc:
+        check("timeout raises with sid", "timed out" in str(exc) and "sid=" in str(exc))
+    check("timed-out job cancelled", state["cancelled"] == "sid_123")
+    state["never_done"] = False
+
+    # --- TLS fallback policy ------------------------------------------------ #
+    strict = SplunkWebClient("https://127.0.0.1:{}".format(port), USER, PASSWORD, verify_ssl=False)
+    try:
+        strict.login()
+        check("explicit https never downgrades", False)
+    except SplunkWebError as exc:
+        check("explicit https never downgrades", "TLS handshake" in str(exc) and strict.base_url.startswith("https://"))
+
+    relaxed = SplunkWebClient("127.0.0.1:{}".format(port), USER, PASSWORD, verify_ssl=False, poll_interval=0.05)
+    relaxed.login()
+    check("bare host falls back to http", relaxed.base_url.startswith("http://127.0.0.1"))
+    out = relaxed.run_search("index=*")
+    check("run_search after http fallback", out.get("sid") == "sid_123")
+
+    # --- concurrent tool calls share one session ---------------------------- #
+    state["login_count"] = 0
+    import threading
+
+    def parallel_call():
+        c2.run_search("index=*")
+
+    c2 = SplunkWebClient(base, USER, PASSWORD, verify_ssl=False, poll_interval=0.05)
+    threads = [threading.Thread(target=parallel_call) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("concurrent calls log in once", state["login_count"] == 1)
 
     # --- auth failures -------------------------------------------------- #
     bad = SplunkWebClient(base, USER, "wrongpass", verify_ssl=False)

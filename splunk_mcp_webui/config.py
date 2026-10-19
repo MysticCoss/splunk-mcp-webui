@@ -32,7 +32,7 @@ class ConfigError(Exception):
 def _candidate_paths() -> List[Path]:
     """Paths searched for config.json. When SPLUNK_MCP_CONFIG is set, that
     file is the ONLY candidate — a broken file must fail loudly instead of
-    silently falling back to another one."""
+    silently falling back to another one or generic defaults."""
     env = os.environ.get("SPLUNK_MCP_CONFIG")
     if env:
         return [Path(env)]
@@ -67,6 +67,9 @@ def _number_value(value: Any, key: str, minimum: float, maximum: Optional[float]
 
 
 def _validate(raw: Dict[str, Any], path: str) -> Dict[str, Any]:
+    """Structural/type validation only — required-key presence is checked
+    after environment overrides are applied, so credentials may come from
+    either the file or the environment."""
     if not isinstance(raw, dict):
         raise ConfigError("Config file '{}' must contain a JSON object".format(path))
 
@@ -83,12 +86,6 @@ def _validate(raw: Dict[str, Any], path: str) -> Dict[str, Any]:
         if value is not None:
             merged[key] = value
 
-    missing = [key for key in REQUIRED_KEYS if not str(merged.get(key, "")).strip()]
-    if missing:
-        raise ConfigError(
-            "Config file '{}' is missing required keys: {}".format(path, ", ".join(missing))
-        )
-
     # verify_ssl: boolean, a boolean-like string, or a CA bundle file path.
     verify = merged["verify_ssl"]
     if isinstance(verify, str):
@@ -96,7 +93,12 @@ def _validate(raw: Dict[str, Any], path: str) -> Dict[str, Any]:
         if low in ("true", "false", "1", "0", "yes", "no", "on", "off"):
             merged["verify_ssl"] = _bool_value(verify, "verify_ssl")
         elif verify.strip():
-            merged["verify_ssl"] = verify.strip()
+            bundle = verify.strip()
+            if not Path(bundle).is_file():
+                raise ConfigError(
+                    "Config key 'verify_ssl' points to a CA bundle that does not exist: {}".format(bundle)
+                )
+            merged["verify_ssl"] = bundle
         else:
             raise ConfigError("Config key 'verify_ssl' must be true, false or a CA bundle path")
     else:
@@ -115,20 +117,33 @@ def _validate(raw: Dict[str, Any], path: str) -> Dict[str, Any]:
 
 def _apply_env_overrides(config: Dict[str, Any]) -> None:
     """Environment variables override file values, so credentials can be
-    provisioned without storing the password on disk."""
+    provisioned without storing the password on disk. Passwords are kept
+    verbatim (no stripping)."""
     env_map = {
-        "SPLUNK_URL": "splunk_url",
-        "SPLUNK_USERNAME": "username",
-        "SPLUNK_PASSWORD": "password",
+        "SPLUNK_URL": ("splunk_url", True),
+        "SPLUNK_USERNAME": ("username", True),
+        "SPLUNK_PASSWORD": ("password", False),
     }
-    for env_name, key in env_map.items():
+    for env_name, (key, strip) in env_map.items():
         value = os.environ.get(env_name)
         if value:
-            config[key] = value.strip()
+            config[key] = value.strip() if strip else value
+
+
+def _check_required(config: Dict[str, Any]) -> None:
+    missing = [key for key in REQUIRED_KEYS if not str(config.get(key, "")).strip()]
+    if missing:
+        raise ConfigError(
+            "Config is missing required keys: {} "
+            "(provide them in config.json or via SPLUNK_URL / SPLUNK_USERNAME / SPLUNK_PASSWORD)".format(
+                ", ".join(missing)
+            )
+        )
 
 
 def load_config() -> Dict[str, Any]:
     candidates = _candidate_paths()
+    explicit_only = bool(os.environ.get("SPLUNK_MCP_CONFIG"))
     last_error: Optional[ConfigError] = None
     for path in candidates:
         try:
@@ -139,33 +154,29 @@ def load_config() -> Dict[str, Any]:
             config = _validate(raw, str(path))
             config["config_path"] = str(path)
             _apply_env_overrides(config)
-            missing = [key for key in REQUIRED_KEYS if not str(config.get(key, "")).strip()]
-            if missing:
-                raise ConfigError(
-                    "Config is missing required keys after applying environment overrides: {}".format(
-                        ", ".join(missing)
-                    )
-                )
+            _check_required(config)
             return config
         except ConfigError:
-            # Fail loudly — never silently fall back to another file.
+            # Fail loudly — never silently fall back to another file or to
+            # generic defaults when an explicitly chosen file is broken.
             raise
         except json.JSONDecodeError as exc:
             last_error = ConfigError("Config file '{}' is not valid JSON: {}".format(path, exc))
+            if explicit_only:
+                raise last_error
 
     config: Dict[str, Any] = dict(DEFAULTS)
     _apply_env_overrides(config)
-    missing = [key for key in REQUIRED_KEYS if not str(config.get(key, "")).strip()]
-    if not missing:
-        return config
-    if last_error is not None:
-        raise last_error
-    searched = ", ".join(str(p) for p in candidates)
-    hint = ""
-    if not os.environ.get("SPLUNK_MCP_CONFIG"):
-        hint = " (or set SPLUNK_URL / SPLUNK_USERNAME / SPLUNK_PASSWORD environment variables)"
-    raise ConfigError(
-        "No usable config found. Create 'config.json' with keys: splunk_url, username, password{}. Searched: {}".format(
-            hint, searched
+    try:
+        _check_required(config)
+    except ConfigError:
+        if last_error is not None:
+            raise last_error
+        searched = ", ".join(str(p) for p in candidates)
+        hint = "" if explicit_only else " (or set SPLUNK_URL / SPLUNK_USERNAME / SPLUNK_PASSWORD environment variables)"
+        raise ConfigError(
+            "No usable config found. Create 'config.json' with keys: splunk_url, username, password{}. Searched: {}".format(
+                hint, searched
+            )
         )
-    )
+    return config

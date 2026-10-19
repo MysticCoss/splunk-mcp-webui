@@ -35,7 +35,11 @@ Hoặc cài như package: `pip install git+https://github.com/MysticCoss/splunk-
 
 ## Cấu hình
 
-Copy `config.example.json` thành `config.json` (cùng thư mục với project) rồi sửa:
+Copy `config.example.json` thành `config.json` rồi sửa. Client tìm config theo thứ tự:
+
+1. Đường dẫn trong biến môi trường `SPLUNK_MCP_CONFIG` (nếu đặt)
+2. `config.json` cạnh thư mục `splunk_mcp_webui/` (khi clone repo)
+3. `~/.splunk-mcp/config.json` (tiện khi cài bằng `pip install git+...` — không có thư mục project)
 
 ```json
 {

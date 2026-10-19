@@ -12,7 +12,6 @@ import logging
 import re
 import threading
 import time
-import urllib.parse
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -160,21 +159,20 @@ class SplunkWebClient:
     def login(self, force: bool = False) -> None:
         """Ensure a valid session exists. Thread-safe: concurrent tool calls
         share one session, so re-login is serialized and deduplicated via a
-        generation counter. After an authentication failure, further attempts
-        are suspended for a cooldown to avoid locking the Splunk account."""
+        generation counter."""
         with self._login_lock:
             if self._logged_in and not force:
                 return
-            if force and time.monotonic() < self._auth_cooldown_until:
-                raise SplunkAuthError(
-                    "Authentication for user '{}' is in cooldown after recent failures; "
-                    "retry in {}s (avoid locking the account)".format(
-                        self.username, round(self._auth_cooldown_until - time.monotonic())
-                    )
-                )
             self._do_login_locked()
 
     def _do_login_locked(self) -> None:
+        if time.monotonic() < self._auth_cooldown_until:
+            raise SplunkAuthError(
+                "Authentication for user '{}' is in cooldown after recent failures; "
+                "retry in {}s (avoids locking the account)".format(
+                    self.username, round(self._auth_cooldown_until - time.monotonic())
+                )
+            )
         self._logged_in = False
         self.session.cookies.clear()
         self.form_key = None
@@ -321,10 +319,10 @@ class SplunkWebClient:
             allow_redirects=False,
         )
 
-        if response.status_code in (401, 403) and not retried:
+        if response.status_code == 401 and not retried:
             # Session expired or CSRF token rotated: refresh once and retry.
-            # If another concurrent call already refreshed the session, skip
-            # straight to the retry instead of forcing a second login.
+            # 403 is a privilege problem — re-logging-in cannot fix it, and
+            # retrying only burns quota (and risks the auth cooldown).
             with self._login_lock:
                 if self._session_generation == generation:
                     self._do_login_locked()
@@ -490,9 +488,12 @@ class SplunkWebClient:
         if latest_time:
             data["latest_time"] = latest_time
         # Server-side safety nets: kill the job if it exceeds the wall clock
-        # or if the client disappears without cancelling it.
-        data["auto_cancel"] = int(self.search_timeout)
-        data["max_time"] = int(self.search_timeout)
+        # or if the client disappears without cancelling it. Splunk starts
+        # counting max_time slightly earlier than the client deadline and
+        # *finalizes* a job at max_time (partial, DONE), so give it a buffer
+        # or the client may silently return short results near the boundary.
+        data["auto_cancel"] = int(self.search_timeout) + 30
+        data["max_time"] = int(self.search_timeout) + 30
 
         created = self._proxy_request("POST", "services/search/jobs", data=data, timeout=self.search_timeout)
         sid = created.get("sid")
@@ -572,8 +573,8 @@ class SplunkWebClient:
             notes = []
             if truncated:
                 notes.append(
-                    "Showing {} of {} results (offset {}). Set offset={} to get the next page."
-                    .format(len(results), result_count, offset, offset + len(results))
+                    "Showing {} of {} results (offset {}). Call splunk_get_job_results(sid='{}', offset={}) to get the next page without re-running the search."
+                    .format(len(results), result_count, offset, sid, offset + len(results))
                 )
             if raw_truncated:
                 notes.append("_raw values were truncated to {} chars (max_raw_chars).".format(max_raw))
@@ -625,11 +626,12 @@ class SplunkWebClient:
 
         state = self._job_state(sid)
         dispatch_state = state.get("dispatchState", "")
-        if dispatch_state == "TIMEOUT" or (not state.get("isDone") in (1, "1", True) and dispatch_state not in ("DONE",)):
-            if dispatch_state == "FAILED":
-                raise SplunkWebError(
-                    "Search job {} failed: {}".format(sid, self._job_messages(state) or "unknown error")
-                )
+        # Splunk FAILED jobs report isDone=1 — check failure first.
+        if dispatch_state == "FAILED" or state.get("isFailed") in (1, "1", True):
+            raise SplunkWebError(
+                "Search job {} failed: {}".format(sid, self._job_messages(state) or "unknown error")
+            )
+        if state.get("isDone") not in (1, "1", True):
             raise SplunkWebError(
                 "Search job {} is not finished yet (state: {}). Poll splunk_get_search_job_status first.".format(
                     sid, dispatch_state or "unknown"
@@ -653,6 +655,8 @@ class SplunkWebClient:
             logger.info("Cancelled search job %s after timeout", sid)
         except SplunkWebError as exc:
             logger.warning("Could not cancel search job %s: %s", sid, exc)
+        except requests.RequestException as exc:
+            logger.warning("Network error cancelling search job %s: %s", sid, exc)
 
     def _wait_for_job(self, sid: str) -> Dict[str, Any]:
         deadline = time.monotonic() + self.search_timeout
@@ -808,7 +812,7 @@ def client_from_config() -> SplunkWebClient:
             username=config["username"],
             password=config["password"],
             locale=config.get("locale", "en-US"),
-            verify_ssl=bool(config.get("verify_ssl", False)),
+            verify_ssl=config.get("verify_ssl", False),
             request_timeout=config.get("request_timeout", 60.0),
             search_timeout=config.get("search_timeout", 300.0),
             poll_interval=config.get("poll_interval", 1.0),

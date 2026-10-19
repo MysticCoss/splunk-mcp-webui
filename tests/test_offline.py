@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from splunk_mcp_webui.client import SplunkAuthError, SplunkWebError, SplunkWebClient
+from splunk_mcp_webui.config import ConfigError
 
 USER = "admin"
 PASSWORD = "changeme"
@@ -63,7 +64,8 @@ SEARCH_RESULTS = {
 }
 
 state = {"jobs": {}, "auth_ok": True, "force_relogin": False, "mode": "legacy",
-         "login_count": 0, "cancelled": None, "never_done": False}
+         "login_count": 0, "cancelled": None, "never_done": False, "job_failed": False,
+         "last_search_body": None}
 
 
 class MockSplunkWeb(BaseHTTPRequestHandler):
@@ -146,6 +148,25 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
                 return
             polls = state["jobs"].get(sid, 0) + 1
             state["jobs"][sid] = polls
+            if state.get("job_failed"):
+                self._send_json(
+                    200,
+                    {
+                        "entry": [
+                            {
+                                "name": sid,
+                                "content": {
+                                    "isDone": 1,
+                                    "dispatchState": "FAILED",
+                                    "isFailed": 1,
+                                    "resultCount": 0,
+                                    "messages": [{"type": "FATAL", "text": "boom"}],
+                                },
+                            }
+                        ]
+                    },
+                )
+                return
             done = polls >= 2 and not state["never_done"]
             self._send_json(
                 200,
@@ -242,6 +263,7 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
             if body.get("exec_mode", ["normal"])[0] == "oneshot":
                 self._send_json(200, SEARCH_RESULTS)
             else:
+                state["last_search_body"] = body
                 self._send_json(201, {"sid": "sid_123"})
             return
 
@@ -399,6 +421,31 @@ def main():
     check("timed-out job cancelled", state["cancelled"] == "sid_123")
     state["never_done"] = False
 
+    # --- FAILED job is reported, not silently fetched ---------------------- #
+    failed_client = SplunkWebClient(base, USER, PASSWORD, verify_ssl=False, poll_interval=0.05)
+    failed_client.login()
+    state["job_failed"] = True
+    try:
+        failed_client.run_search("index=*")
+        check("run_search reports failed job", False)
+    except SplunkWebError as exc:
+        check("run_search reports failed job", "FATAL" in str(exc) or "failed" in str(exc))
+    try:
+        failed_client.get_job_results("sid_123")
+        check("get_job_results reports failed job", False)
+    except SplunkWebError as exc:
+        check("get_job_results reports failed job", "failed" in str(exc))
+    state["job_failed"] = False
+
+    # --- server-side max_time gets a buffer over the client deadline ------- #
+    state["last_search_body"] = None
+    failed_client.run_search("index=*")
+    sent = state.get("last_search_body") or {}
+    check(
+        "max_time buffered over deadline",
+        int(sent.get("max_time", ["0"])[0]) >= 300 and int(sent.get("auto_cancel", ["0"])[0]) > 300,
+    )
+
     # --- TLS fallback policy ------------------------------------------------ #
     strict = SplunkWebClient("https://127.0.0.1:{}".format(port), USER, PASSWORD, verify_ssl=False)
     try:
@@ -435,6 +482,66 @@ def main():
         check("bad password raises", False)
     except SplunkAuthError:
         check("bad password raises", True)
+
+    # --- auth cooldown stops repeat login attempts ----------------------- #
+    logins_before = state["login_count"]
+    try:
+        bad.login()
+        check("cooldown blocks repeat login", False)
+    except SplunkAuthError as exc:
+        check("cooldown blocks repeat login", "cooldown" in str(exc))
+    check("no extra login POST during cooldown", state["login_count"] == logins_before)
+
+    # --- CA bundle path passes through to requests ------------------------ #
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+
+    ca_handle = _tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+    ca_handle.write("dummy")
+    ca_handle.close()
+    cfg_handle = _tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    _json.dump(
+        {"splunk_url": "http://127.0.0.1", "username": "u", "password": "p", "verify_ssl": ca_handle.name},
+        cfg_handle,
+    )
+    cfg_handle.close()
+    old_cfg_env = _os.environ.get("SPLUNK_MCP_CONFIG")
+    _os.environ["SPLUNK_MCP_CONFIG"] = cfg_handle.name
+    try:
+        from splunk_mcp_webui.client import client_from_config
+
+        ca_client = client_from_config()
+        check("CA bundle path intact in client", ca_client.session.verify == ca_handle.name)
+    finally:
+        if old_cfg_env is None:
+            _os.environ.pop("SPLUNK_MCP_CONFIG", None)
+        else:
+            _os.environ["SPLUNK_MCP_CONFIG"] = old_cfg_env
+        _os.unlink(ca_handle.name)
+        _os.unlink(cfg_handle.name)
+
+    # non-existent CA bundle is rejected at config load
+    cfg_handle = _tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    _json.dump(
+        {"splunk_url": "http://127.0.0.1", "username": "u", "password": "p", "verify_ssl": "Z:/no/such/ca.pem"},
+        cfg_handle,
+    )
+    cfg_handle.close()
+    _os.environ["SPLUNK_MCP_CONFIG"] = cfg_handle.name
+    try:
+        try:
+            from splunk_mcp_webui.client import client_from_config as _cfc
+
+            _cfc()
+            check("missing CA bundle rejected", False)
+        except ConfigError as exc:
+            check("missing CA bundle rejected", "does not exist" in str(exc))
+    except SplunkAuthError:
+        check("missing CA bundle rejected", False)
+    finally:
+        _os.environ.pop("SPLUNK_MCP_CONFIG", None)
+        _os.unlink(cfg_handle.name)
 
     # --- session expiry triggers re-login ------------------------------ #
     state["auth_ok"] = False  # next login attempts will fail -> proves relogin not called

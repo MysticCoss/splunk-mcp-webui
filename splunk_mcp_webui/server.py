@@ -83,7 +83,7 @@ def splunk_run_query(
         earliest_time: Start time for search (e.g., -24h, -1d).
         latest_time: End time for search (e.g., now, -1h). Defaults to now.
         row_limit: Max rows to return (1-1000). None uses config default (default_row_limit, typically 100).
-        offset: Result offset. When truncated=true, re-run with offset=next_offset to page through results.
+        offset: Result offset. When truncated=true, fetch the next page by reusing the sid with splunk_get_job_results, or re-run with offset=next_offset.
         max_raw_chars: Max characters per _raw value (0 disables truncation). None uses config default.
     """
     return _json(

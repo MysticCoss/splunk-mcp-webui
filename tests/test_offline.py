@@ -14,6 +14,8 @@ from splunk_mcp_webui.client import SplunkAuthError, SplunkWebError, SplunkWebCl
 USER = "admin"
 PASSWORD = "changeme"
 FORM_KEY = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+MODERN_CSRF = "csrf-token-987654321"
+MODERN_CVAL = "cval-cookie-12345"
 
 INDEXES_PAYLOAD = {
     "entry": [
@@ -60,7 +62,7 @@ SEARCH_RESULTS = {
     ],
 }
 
-state = {"jobs": {}, "auth_ok": True, "force_relogin": False}
+state = {"jobs": {}, "auth_ok": True, "force_relogin": False, "mode": "legacy"}
 
 
 class MockSplunkWeb(BaseHTTPRequestHandler):
@@ -73,8 +75,8 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
-        for key, value in (headers or {}).items():
-            self.send_header(key, value)
+        for name, value in headers or []:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -98,6 +100,18 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/en-US/account/login":
+            if state["mode"] == "modern":
+                # Modern Splunk behind SSO: no CSRF value in the HTML, the
+                # cval is delivered as a cookie instead.
+                self._send(
+                    200,
+                    "<html><body>login form rendered by JS</body></html>",
+                    headers=[
+                        ("Set-Cookie", "cval={}; Path=/".format(MODERN_CVAL)),
+                        ("Set-Cookie", "splunkweb_uid=MODERN-UID; Path=/"),
+                    ],
+                )
+                return
             self._send(
                 200,
                 '<html><form><input name="cval" value="{}"><input name="username">'
@@ -107,12 +121,12 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
             self._send(200, '<html>{"cval":"%s"}</html>' % FORM_KEY)
         elif path == "/en-US/splunkd/__raw/services/search/jobs" :
             if not self._authed():
-                self._send(302, "", headers={"Location": "/en-US/account/login"})
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
             self._send_json(200, {"entry": []})
         elif path.startswith("/en-US/splunkd/__raw/services/search/jobs/"):
             if not self._authed():
-                self._send(302, "", headers={"Location": "/en-US/account/login"})
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
             parts = path.strip("/").split("/")
             sid = parts[-1]
@@ -146,12 +160,12 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
             )
         elif path == "/en-US/splunkd/__raw/servicesNS/-/-/data/indexes":
             if not self._authed():
-                self._send(302, "", headers={"Location": "/en-US/account/login"})
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
             self._send_json(200, INDEXES_PAYLOAD)
         elif path.startswith("/en-US/splunkd/__raw/servicesNS/-/-/data/indexes/"):
             if not self._authed():
-                self._send(302, "", headers={"Location": "/en-US/account/login"})
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
             name = path.rstrip("/").split("/")[-1]
             entry = next((e for e in INDEXES_PAYLOAD["entry"] if e["name"] == name), None)
@@ -170,14 +184,32 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
         if path == "/en-US/account/login":
             username = body.get("username", [""])[0]
             password = body.get("password", [""])[0]
+            if state["mode"] == "modern":
+                # Modern flow: cval must be posted back and must match the
+                # pre-auth cval cookie; success returns 200 + cookies.
+                jar = self._cookies()
+                cval_ok = body.get("cval", [""])[0] == jar.get("cval")
+                if state["auth_ok"] and cval_ok and username == USER and password == PASSWORD:
+                    self._send(
+                        200,
+                        '{"status":0}',
+                        headers=[
+                            ("Set-Cookie", "splunkd_8000=sess-key-1; Path=/"),
+                            ("Set-Cookie", "splunkweb_csrf_token_8000={}; Path=/".format(MODERN_CSRF)),
+                        ],
+                        content_type="application/json",
+                    )
+                else:
+                    self._send(401, '{"status":1}', content_type="application/json")
+                return
             if state["auth_ok"] and username == USER and password == PASSWORD:
                 self._send(
                     303,
                     "",
-                    headers={
-                        "Location": "/en-US/app/launcher/home",
-                        "Set-Cookie": "splunkd_8000=sess-key-1; Path=/",
-                    },
+                    headers=[
+                        ("Location", "/en-US/app/launcher/home"),
+                        ("Set-Cookie", "splunkd_8000=sess-key-1; Path=/"),
+                    ],
                 )
             else:
                 self._send(401, "<html>Login failed</html>")
@@ -185,9 +217,14 @@ class MockSplunkWeb(BaseHTTPRequestHandler):
 
         if path == "/en-US/splunkd/__raw/services/search/jobs":
             if not self._authed():
-                self._send(302, "", headers={"Location": "/en-US/account/login"})
+                self._send(302, "", headers=[("Location", "/en-US/account/login")])
                 return
-            if self.headers.get("X-Splunk-Form-Key") != FORM_KEY:
+            if state["mode"] == "modern":
+                jar = self._cookies()
+                expected_form_key = jar.get("splunkweb_csrf_token_8000")
+            else:
+                expected_form_key = FORM_KEY
+            if self.headers.get("X-Splunk-Form-Key") != expected_form_key:
                 self._send_json(400, {"messages": [{"type": "ERROR", "text": "Missing or invalid CSRF header"}]})
                 return
             if body.get("exec_mode", ["normal"])[0] == "oneshot":
@@ -333,6 +370,23 @@ def main():
     client.session.cookies.clear()
     out = client.run_search("index=*")
     check("re-login after session loss", out.get("sid") == "sid_123")
+
+    # --- modern SSO-style login (cval/csrf delivered via cookies) ------- #
+    state["mode"] = "modern"
+    modern = SplunkWebClient(base, USER, PASSWORD, verify_ssl=False, poll_interval=0.05)
+    modern.login()
+    check("modern login sets session cookie", any(c.lower().startswith("splunkd") for c in modern.session.cookies.keys()))
+    check("modern form key from csrf cookie", modern.form_key == MODERN_CSRF)
+    out = modern.run_search("index=*")
+    check("modern run_search", out.get("sid") == "sid_123")
+
+    bad_modern = SplunkWebClient(base, USER, "wrongpass", verify_ssl=False)
+    try:
+        bad_modern.login()
+        check("modern bad password raises", False)
+    except SplunkAuthError:
+        check("modern bad password raises", True)
+    state["mode"] = "legacy"
 
     failed = [name for name, ok in results if not ok]
     print("\n{}/{} tests passed".format(len(results) - len(failed), len(results)))

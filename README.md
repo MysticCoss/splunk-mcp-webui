@@ -40,6 +40,24 @@ Copy `config.example.json` thành `config.json` (cùng thư mục với project)
 
 > `config.json` chứa credential thật nên đã bị `.gitignore` loại khỏi repo — chỉ commit `config.example.json`.
 
+## SSL self-signed
+
+Mặc định client **chấp nhận mọi chứng chỉ SSL** — kể cả self-signed, cert nội bộ hay cert tự ký của Splunk:
+
+```json
+{
+  "verify_ssl": false
+}
+```
+
+Đây là giá trị mặc định, không cần khai báo trong `config.json`. Chỉ khi muốn xác thực chứng chỉ nghiêm ngặt (ví dụ Splunk dùng cert CA hợp lệ) thì mới đặt:
+
+```json
+{
+  "verify_ssl": true
+}
+```
+
 Đó là tất cả. Mọi thứ khác tự xử lý: tự detect `http/https`, locale (`en-US`...), session cookie, CSRF form-key, tự re-login khi session hết hạn, SSL self-signed được tự động chấp nhận.
 
 > `splunk_url` chấp nhận mọi dạng: `splunk.corp.local`, `http://10.0.0.5:8000`, `https://splunk.corp.local:8000/en-US`.

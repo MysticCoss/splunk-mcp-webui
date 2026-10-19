@@ -1,0 +1,5 @@
+{
+  "splunk_url": "https://splunk.example.com",
+  "username": "admin",
+  "password": "your-password"
+}

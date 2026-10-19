@@ -37,12 +37,23 @@ def main():
 
     async def run():
         async def call(name, args=None):
-            result = await server_module.mcp.call_tool(name, args or {})
+            try:
+                result = await server_module.mcp.call_tool(name, args or {})
+            except Exception as exc:  # mcp versions that propagate tool errors
+                return {"error": str(exc), "raised": True}
             if isinstance(result, tuple):  # mcp 1.x
-                result = result[0][0]
+                content = result[0][0]
+                error = getattr(result, "isError", None) or (len(result) > 1 and getattr(result[1], "isError", False))
             else:  # mcp 2.x CallToolResult
-                result = result.content[0]
-            return json.loads(result.text)
+                content = result.content[0]
+                error = getattr(result, "isError", False)
+            try:
+                payload = json.loads(content.text)
+            except (ValueError, AttributeError):
+                payload = {"error": content.text, "isError": bool(error)}
+            if error:
+                payload.setdefault("isError", True)
+            return payload
 
         tools = await server_module.mcp.list_tools()
         names = sorted(t.name for t in tools)
@@ -50,7 +61,9 @@ def main():
         assert names == [
             "splunk_get_index_info",
             "splunk_get_indexes",
+            "splunk_get_job_results",
             "splunk_get_metadata",
+            "splunk_get_search_job_status",
             "splunk_run_query",
         ], names
 
@@ -62,6 +75,15 @@ def main():
         print("splunk_run_query ->", payload["result_count"], "rows, sid:", payload["sid"])
         assert payload["result_count"] == 2
 
+        # paginate the finished job by sid without re-running the search
+        payload = await call("splunk_get_job_results", {"sid": payload["sid"], "row_limit": 1, "offset": 1})
+        print("splunk_get_job_results ->", payload["result_count"], "row at offset", payload["offset"])
+        assert payload["result_count"] == 1 and payload["offset"] == 1
+
+        payload = await call("splunk_get_search_job_status", {"sid": "sid_123"})
+        print("splunk_get_search_job_status ->", payload["dispatch_state"])
+        assert payload["is_done"] is True and payload["result_count"] == 2
+
         payload = await call("splunk_get_index_info", {"index_name": "main"})
         print("splunk_get_index_info ->", payload["index"]["name"])
         assert payload["index"]["name"] == "main"
@@ -71,8 +93,9 @@ def main():
         assert payload["result_count"] == 2
 
         payload = await call("splunk_get_index_info", {"index_name": "nope"})
-        print("missing index ->", payload)
-        assert payload.get("status_code") == 404
+        text = json.dumps(payload)
+        assert ("Not found" in text) and (payload.get("isError") is True or payload.get("raised")), payload
+        print("missing index -> reported as error:", text[:100])
 
         print("\nMCP server wiring OK")
 

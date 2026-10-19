@@ -57,6 +57,11 @@ _MACRO_RE = re.compile(r"`[^`]+`")
 _REST_PASSWORD_RE = re.compile(r"storage[_/]?password", re.IGNORECASE)
 _MAX_GUARD_DEPTH = 3
 
+# Splunk storage-internal bookkeeping fields — pure noise for LLM consumers.
+_INTERNAL_RESULT_FIELDS = ("_bkt", "_cd", "_si", "_serial", "_indextime")
+
+_SID_RE = re.compile(r"^[0-9._A-Za-z-]+$")
+
 # Fields kept in the compact (default) index listing; the full flattened
 # entry carries 100+ low-level storage settings that waste LLM context.
 _COMPACT_INDEX_FIELDS = (
@@ -115,7 +120,7 @@ class SplunkWebClient:
         self.verify_ssl = verify_ssl
         self.request_timeout = float(request_timeout)
         self.search_timeout = float(search_timeout)
-        self.poll_interval = max(0.2, float(poll_interval))
+        self.poll_interval = max(0.05, float(poll_interval))
         self.default_row_limit = int(default_row_limit)
         self.max_row_limit = int(max_row_limit)
         self.max_raw_chars = max(0, int(max_raw_chars))
@@ -513,7 +518,23 @@ class SplunkWebClient:
 
         result_count = int(job_info.get("resultCount") or 0)
         results, fields = self._fetch_results(sid, row_limit, offset)
+        raw_truncated = self._post_process_results(results, max_raw)
 
+        output = self._build_output(sid, results, fields, result_count, offset, raw_truncated, max_raw)
+        messages = self._job_messages(job_info)
+        if messages:
+            output["messages"] = messages
+        if job_info.get("runDuration"):
+            output["run_duration_seconds"] = round(float(job_info["runDuration"]), 3)
+        return output
+
+    @staticmethod
+    def _post_process_results(results: List[Dict[str, Any]], max_raw: int) -> bool:
+        """Strip storage-internal fields and cap _raw length in place.
+        Returns True when any _raw value was truncated."""
+        for row in results:
+            for field in _INTERNAL_RESULT_FIELDS:
+                row.pop(field, None)
         raw_truncated = False
         if max_raw > 0:
             for row in results:
@@ -521,7 +542,18 @@ class SplunkWebClient:
                 if isinstance(raw, str) and len(raw) > max_raw:
                     row["_raw"] = raw[:max_raw]
                     raw_truncated = True
+        return raw_truncated
 
+    @staticmethod
+    def _build_output(
+        sid: str,
+        results: List[Dict[str, Any]],
+        fields: List[Dict[str, Any]],
+        result_count: int,
+        offset: int,
+        raw_truncated: bool,
+        max_raw: int,
+    ) -> Dict[str, Any]:
         output: Dict[str, Any] = {
             "sid": sid,
             "results": results,
@@ -530,10 +562,6 @@ class SplunkWebClient:
             "offset": offset,
             "fields": fields,
         }
-        messages = self._job_messages(job_info)
-        if messages:
-            output["messages"] = messages
-
         truncated = offset + len(results) < result_count
         if truncated:
             output["truncated"] = True
@@ -550,10 +578,68 @@ class SplunkWebClient:
             if raw_truncated:
                 notes.append("_raw values were truncated to {} chars (max_raw_chars).".format(max_raw))
             output["note"] = " ".join(notes)
-
-        if job_info.get("runDuration"):
-            output["run_duration_seconds"] = round(float(job_info["runDuration"]), 3)
         return output
+
+    def _job_state(self, sid: str) -> Dict[str, Any]:
+        sid = (sid or "").strip()
+        if not _SID_RE.fullmatch(sid):
+            raise SplunkWebError("Invalid search id")
+        payload = self._proxy_request(
+            "GET",
+            "services/search/jobs/{}".format(sid),
+            params={"output_mode": "json"},
+        )
+        entries = payload.get("entry") or []
+        if not entries:
+            raise SplunkWebError("Search job '{}' was not found or is not accessible".format(sid), status_code=404)
+        return (entries[0].get("content") or {}).copy()
+
+    def get_job_status(self, sid: str) -> Dict[str, Any]:
+        """Inspect a previously created search job without re-running it."""
+        content = self._job_state(sid)
+        return {
+            "sid": sid,
+            "dispatch_state": content.get("dispatchState", ""),
+            "is_done": content.get("isDone") in (1, "1", True),
+            "result_count": int(content.get("resultCount") or 0),
+            "run_duration_seconds": round(float(content["runDuration"]), 3) if content.get("runDuration") else None,
+        }
+
+    def get_job_results(
+        self,
+        sid: str,
+        row_limit: Optional[int] = None,
+        offset: int = 0,
+        max_raw_chars: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch results from an existing (finished) search job without
+        re-running the search — cheaper pagination for large result sets."""
+        sid = (sid or "").strip()
+        if not _SID_RE.fullmatch(sid):
+            raise SplunkWebError("Invalid search id")
+
+        row_limit = self.default_row_limit if row_limit is None else int(row_limit)
+        row_limit = max(1, min(row_limit, self.max_row_limit))
+        offset = max(0, int(offset or 0))
+        max_raw = self.max_raw_chars if max_raw_chars is None else max(0, int(max_raw_chars))
+
+        state = self._job_state(sid)
+        dispatch_state = state.get("dispatchState", "")
+        if dispatch_state == "TIMEOUT" or (not state.get("isDone") in (1, "1", True) and dispatch_state not in ("DONE",)):
+            if dispatch_state == "FAILED":
+                raise SplunkWebError(
+                    "Search job {} failed: {}".format(sid, self._job_messages(state) or "unknown error")
+                )
+            raise SplunkWebError(
+                "Search job {} is not finished yet (state: {}). Poll splunk_get_search_job_status first.".format(
+                    sid, dispatch_state or "unknown"
+                )
+            )
+
+        result_count = int(state.get("resultCount") or 0)
+        results, fields = self._fetch_results(sid, row_limit, offset)
+        raw_truncated = self._post_process_results(results, max_raw)
+        return self._build_output(sid, results, fields, result_count, offset, raw_truncated, max_raw)
 
     def _cancel_job(self, sid: str) -> None:
         """Best-effort job cancellation so timed-out searches do not keep
@@ -683,6 +769,7 @@ class SplunkWebClient:
         earliest_time: Optional[str] = None,
         latest_time: Optional[str] = None,
         row_limit: Optional[int] = None,
+        offset: int = 0,
     ) -> Dict[str, Any]:
         metadata_type = (metadata_type or "").strip().lower()
         if metadata_type not in ("hosts", "sources", "sourcetypes"):
@@ -693,18 +780,21 @@ class SplunkWebClient:
                 "Index pattern may only contain letters, numbers, underscore, dash and * wildcard"
             )
 
+        # %z keeps the Splunk user's timezone offset in the value so the
+        # timestamps are never mistaken for UTC.
         query = (
             "| metadata type={} index={} | eval firstTimeIso=if(isnull(firstTime) OR firstTime='', "
-            "'Never', strftime(firstTime, \"%Y-%m-%dT%H:%M:%SZ\")), "
+            "'Never', strftime(firstTime, \"%Y-%m-%dT%H:%M:%S%z\")), "
             "lastTimeIso=if(isnull(lastTime) OR lastTime='', 'Never', strftime(lastTime, "
-            "\"%Y-%m-%dT%H:%M:%SZ\")), recentTimeIso=if(isnull(recentTime) OR recentTime='', "
-            "'Never', strftime(recentTime, \"%Y-%m-%dT%H:%M:%SZ\"))".format(metadata_type, index)
+            "\"%Y-%m-%dT%H:%M:%S%z\")), recentTimeIso=if(isnull(recentTime) OR recentTime='', "
+            "'Never', strftime(recentTime, \"%Y-%m-%dT%H:%M:%S%z\"))".format(metadata_type, index)
         )
         return self.run_search(
             query,
             earliest_time=earliest_time,
             latest_time=latest_time,
             row_limit=row_limit,
+            offset=offset,
         )
 
 

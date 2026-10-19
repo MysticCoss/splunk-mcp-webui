@@ -1,5 +1,7 @@
 # Splunk MCP WebUI
 
+[![CI](https://github.com/MysticCoss/splunk-mcp-webui/actions/workflows/ci.yml/badge.svg)](https://github.com/MysticCoss/splunk-mcp-webui/actions/workflows/ci.yml)
+
 MCP (Model Context Protocol) server cho Splunk — dựa trên các tool của Splunk MCP Server chính hãng, nhưng:
 
 | | MCP chính hãng | Splunk MCP WebUI |
@@ -14,8 +16,8 @@ Chỉ cần Splunk Web mở được là dùng được — không cần port qu
 
 | Tool | Mô tả |
 |---|---|
-| `splunk_run_query` | Chạy SPL query, trả về kết quả JSON (mặc định 100 dòng, tự đánh dấu `truncated` nếu nhiều hơn) |
-| `splunk_get_indexes` | Danh sách toàn bộ index (tên, kích thước, số event, splunk_server) |
+| `splunk_run_query` | Chạy SPL query, trả về kết quả JSON (mặc định 100 dòng, có `truncated` + `next_offset` để lấy trang tiếp; `_raw` tự cắt ở 1000 ký tự) |
+| `splunk_get_indexes` | Danh sách index dạng compact (tên, kích thước, số event, splunk_server...); `full: true` để lấy toàn bộ config |
 | `splunk_get_index_info` | Thông tin chi tiết 1 index |
 | `splunk_get_metadata` | Metadata `hosts` / `sources` / `sourcetypes` theo index và khoảng thời gian |
 
@@ -39,6 +41,20 @@ Copy `config.example.json` thành `config.json` (cùng thư mục với project)
 ```
 
 > `config.json` chứa credential thật nên đã bị `.gitignore` loại khỏi repo — chỉ commit `config.example.json`.
+
+Các key tùy chọn (đều có giá trị mặc định, không cần khai báo):
+
+| Key | Mặc định | Mô tả |
+|---|---|---|
+| `locale` | `en-US` | Locale path của Splunk Web (`vi-VN`, `en-US`...) — tự detect khi có thể |
+| `verify_ssl` | `false` | Xác thực chứng chỉ SSL — mặc định chấp nhận self-signed (xem bên dưới) |
+| `read_only` | `true` | Chặn các SPL command sửa dữ liệu: `delete`, `outputlookup`, `collect`, `script`, `sendemail`... Đặt `false` để cho phép |
+| `max_raw_chars` | `1000` | Giới hạn ký tự của field `_raw` trong kết quả search (0 = không giới hạn) |
+| `request_timeout` | `60` | Timeout cho mỗi HTTP request (giây) |
+| `search_timeout` | `300` | Timeout tối đa cho 1 search job (giây) |
+| `poll_interval` | `1` | Chu kỳ poll trạng thái job (giây) |
+| `default_row_limit` | `100` | Số dòng trả về mặc định của `splunk_run_query` |
+| `max_row_limit` | `1000` | Số dòng tối đa mỗi lần fetch — kết quả nhiều hơn thì dùng `offset` để lấy trang tiếp |
 
 ## SSL self-signed
 
